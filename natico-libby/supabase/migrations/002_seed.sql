@@ -35,7 +35,7 @@ begin
     crypt('libby-natico-001', gen_salt('bf')),
     now(), now(), now(),
     '{"provider":"email","providers":["email"]}',
-    '{"user_code":"001","display_name":"Libby Natico","role":"user"}',
+    '{"user_code":"001","display_name":"Matthew Herbert","role":"user"}',
     false, '', '', '', ''
   )
   on conflict (id) do nothing;
@@ -44,7 +44,7 @@ begin
   insert into public.profiles (id, user_code, display_name, role)
   values
     (uid_000, '000', 'Libby System', 'admin'),
-    (uid_001, '001', 'Libby Natico', 'user')
+    (uid_001, '001', 'Matthew Herbert', 'user')
   on conflict (id) do nothing;
 
   -- Default preferences

@@ -42,7 +42,12 @@ export default function SettingsPage() {
 
     const [profileRes, prefsRes] = await Promise.all([
       supabase.from('profiles').select('*').eq('id', user.id).single(),
-      supabase.from('user_preferences').select('*').eq('user_id', user.id).single(),
+      // Never select openrouter_api_key on the client — key is server-only
+      supabase
+        .from('user_preferences')
+        .select('id, user_id, spoken_replies, theme, openrouter_model, created_at')
+        .eq('user_id', user.id)
+        .single(),
     ])
 
     const p = profileRes.data as Profile | null

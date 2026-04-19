@@ -19,15 +19,16 @@ export async function POST(request: NextRequest) {
   const message = (body.message as string) ?? ''
   const context = (body.context as WorkspaceContext) ?? {}
 
-  // Resolve API key: user's BYOK key → server env fallback → rule-based
+  // BYOK only — read user's own key. No server-side fallback by design.
+  // If the user has not configured a key, rule-based mode is used.
   const { data: prefs } = await supabase
     .from('user_preferences')
     .select('openrouter_api_key, openrouter_model')
     .eq('user_id', user.id)
     .single()
 
-  const apiKey = prefs?.openrouter_api_key || process.env.OPENROUTER_API_KEY
-  const model = prefs?.openrouter_model || DEFAULT_MODEL
+  const apiKey = prefs?.openrouter_api_key ?? null
+  const model = prefs?.openrouter_model ?? DEFAULT_MODEL
 
   if (apiKey) {
     try {
@@ -51,17 +52,31 @@ export async function POST(request: NextRequest) {
         }),
       })
 
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        return NextResponse.json({
+          reply: `OpenRouter returned an error (${res.status}): ${(err as Record<string, unknown>)?.error ?? 'unknown'}. Falling back to rule-based guidance.`,
+          source: 'error',
+          fallback: ruleBasedReply(message, context),
+        })
+      }
+
       const data = await res.json()
       const reply =
         data?.choices?.[0]?.message?.content ??
-        'I reached OpenRouter but got an unexpected response. ' + summarizeContext(context)
-      return NextResponse.json({ reply, model, source: 'openrouter' })
-    } catch {
-      // fall through to rule-based
+        'OpenRouter responded but the reply was empty. ' + summarizeContext(context)
+
+      return NextResponse.json({ reply, model, source: 'live' })
+    } catch (e) {
+      return NextResponse.json({
+        reply: 'Could not reach OpenRouter. Check your key and network, then try again.',
+        source: 'error',
+        fallback: ruleBasedReply(message, context),
+      })
     }
   }
 
-  // Rule-based fallback — works with zero API keys
+  // No key configured — deterministic rule-based mode
   const reply = ruleBasedReply(message, context)
   return NextResponse.json({ reply, source: 'rule-based' })
 }
@@ -75,18 +90,18 @@ function buildSystemPrompt(ctx: WorkspaceContext): string {
   return `You are Libby, the NATICO workspace assistant — a knowledgeable, concise, and honest wizard-librarian. You help users manage matters, files, calendar events, and connectors.
 
 Current workspace state:
-- Page: ${ctx.route || 'unknown'}
+- Page: ${ctx.route || 'workspace'}
 - Matters: ${ctx.mattersCount}
 - Files: ${ctx.filesCount}
 - Unread alerts: ${ctx.unreadAlertsCount}
 - Connected providers: ${connected}
 
 Rules:
-- Never fabricate data you don't have.
+- Never fabricate data you do not have.
 - If a connector is disconnected, say so honestly.
-- Recommend specific next steps.
+- Recommend specific next steps based on real state.
 - Keep replies under 120 words.
-- Do not use markdown in responses.`
+- Do not use markdown formatting in responses.`
 }
 
 function summarizeContext(ctx: WorkspaceContext): string {
@@ -104,32 +119,36 @@ function ruleBasedReply(message: string, ctx: WorkspaceContext): string {
     return `Hello! I'm Libby, your NATICO workspace assistant. ${summarizeContext(ctx)} What would you like to work on?`
   }
   if (lower.includes('matter')) {
-    if (ctx.mattersCount === 0) return "You don't have any matters yet. Go to the Matters page and create your first one to get started."
+    if (ctx.mattersCount === 0)
+      return "You don't have any matters yet. Go to the Matters page to create your first one."
     return `You have ${ctx.mattersCount} matter${ctx.mattersCount !== 1 ? 's' : ''}. Head to the Matters page to review or add to them.`
   }
   if (lower.includes('file') || lower.includes('upload') || lower.includes('document')) {
-    if (ctx.filesCount === 0) return "No files have been uploaded yet. Go to the Files page to upload your first document."
+    if (ctx.filesCount === 0)
+      return 'No files have been uploaded yet. Go to the Files page to upload your first document.'
     return `You have ${ctx.filesCount} file${ctx.filesCount !== 1 ? 's' : ''} uploaded. Visit the Files page to manage them.`
   }
   if (lower.includes('calendar') || lower.includes('event') || lower.includes('schedule')) {
     const cal = ctx.connectors.find((c) => c.provider === 'google_calendar')
-    if (!cal || cal.status !== 'connected') return "Google Calendar is not connected. Visit the Connectors page to link your calendar."
-    return "Your Google Calendar is connected. Visit the Calendar page to see your upcoming events."
+    if (!cal || cal.status !== 'connected')
+      return 'Google Calendar is not connected. Visit the Connectors page to link your calendar.'
+    return 'Your Google Calendar is connected. Visit the Calendar page to see your upcoming events.'
   }
   if (lower.includes('github') || lower.includes('repo')) {
     const gh = ctx.connectors.find((c) => c.provider === 'github')
-    if (!gh || gh.status !== 'connected') return "GitHub is not connected. Visit the Connectors page to link your account."
-    return "Your GitHub account is connected. Visit the Connectors page to view your repositories."
+    if (!gh || gh.status !== 'connected')
+      return 'GitHub is not connected. Visit the Connectors page to link your account.'
+    return 'Your GitHub account is connected. Visit the Connectors page to view your repositories.'
   }
   if (lower.includes('alert') || lower.includes('notification')) {
-    if (ctx.unreadAlertsCount === 0) return "You have no unread alerts. Your workspace is clear."
+    if (ctx.unreadAlertsCount === 0) return 'You have no unread alerts. Your workspace is clear.'
     return `You have ${ctx.unreadAlertsCount} unread alert${ctx.unreadAlertsCount !== 1 ? 's' : ''}. Visit the Alerts page to review them.`
   }
-  if (lower.includes('key') || lower.includes('openrouter') || lower.includes('api')) {
-    return "To enable AI-powered replies, go to Settings and enter your OpenRouter API key. OpenRouter supports many models including GPT-4o, Claude, and Gemini."
+  if (lower.includes('key') || lower.includes('openrouter') || lower.includes('ai')) {
+    return 'To enable live AI replies, go to Settings and enter your OpenRouter API key. Without a key, I operate in rule-based mode and can still help you navigate your workspace.'
   }
   if (lower.includes('help') || lower.includes('what can you do')) {
-    return "I can help you navigate your workspace. Ask me about matters, files, alerts, calendar, or connectors. Add your OpenRouter API key in Settings for full AI replies."
+    return 'I can summarize your workspace, help you navigate matters, files, alerts, calendar, and connectors. Add your OpenRouter API key in Settings for full AI responses.'
   }
-  return `I'm running in basic mode — add your OpenRouter API key in Settings to enable full AI replies. Your workspace: ${summarizeContext(ctx)}`
+  return `I'm in rule-based mode. Add your OpenRouter API key in Settings to enable full AI replies. Your workspace: ${summarizeContext(ctx)}`
 }

@@ -12,6 +12,8 @@ export interface UserPreferences {
   user_id: string
   spoken_replies: boolean
   theme: string
+  openrouter_api_key?: string | null
+  openrouter_model: string
   created_at: string
 }
 

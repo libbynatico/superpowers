@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import type { WorkspaceContext } from '@/types'
 
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
+const DEFAULT_MODEL = 'openai/gpt-4o-mini'
+
 export async function POST(request: NextRequest) {
   const supabase = await createClient()
   const {
@@ -16,40 +19,59 @@ export async function POST(request: NextRequest) {
   const message = (body.message as string) ?? ''
   const context = (body.context as WorkspaceContext) ?? {}
 
-  // If Anthropic API key is configured, use Claude
-  if (process.env.ANTHROPIC_API_KEY) {
+  // Resolve API key: user's BYOK key → server env fallback → rule-based
+  const { data: prefs } = await supabase
+    .from('user_preferences')
+    .select('openrouter_api_key, openrouter_model')
+    .eq('user_id', user.id)
+    .single()
+
+  const apiKey = prefs?.openrouter_api_key || process.env.OPENROUTER_API_KEY
+  const model = prefs?.openrouter_model || DEFAULT_MODEL
+
+  if (apiKey) {
     try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
+      const appUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'https://natico.netlify.app'
+      const res = await fetch(OPENROUTER_URL, {
         method: 'POST',
         headers: {
-          'x-api-key': process.env.ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-          'content-type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': appUrl,
+          'X-Title': 'NATICO Libby Live',
         },
         body: JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 512,
-          system: buildSystemPrompt(context),
-          messages: [{ role: 'user', content: message }],
+          model,
+          temperature: 0.3,
+          max_tokens: 900,
+          messages: [
+            { role: 'system', content: buildSystemPrompt(context) },
+            { role: 'user', content: message },
+          ],
         }),
       })
+
       const data = await res.json()
       const reply =
-        data?.content?.[0]?.text ??
-        'I encountered an issue with my AI backend. Here is what I know from your workspace: ' +
-          summarizeContext(context)
-      return NextResponse.json({ reply })
+        data?.choices?.[0]?.message?.content ??
+        'I reached OpenRouter but got an unexpected response. ' + summarizeContext(context)
+      return NextResponse.json({ reply, model, source: 'openrouter' })
     } catch {
       // fall through to rule-based
     }
   }
 
-  // Rule-based context-aware assistant
+  // Rule-based fallback — works with zero API keys
   const reply = ruleBasedReply(message, context)
-  return NextResponse.json({ reply })
+  return NextResponse.json({ reply, source: 'rule-based' })
 }
 
 function buildSystemPrompt(ctx: WorkspaceContext): string {
+  const connected = ctx.connectors
+    .filter((c) => c.status === 'connected')
+    .map((c) => (c.provider === 'google_calendar' ? 'Google Calendar' : 'GitHub'))
+    .join(', ') || 'none'
+
   return `You are Libby, the NATICO workspace assistant — a knowledgeable, concise, and honest wizard-librarian. You help users manage matters, files, calendar events, and connectors.
 
 Current workspace state:
@@ -57,7 +79,7 @@ Current workspace state:
 - Matters: ${ctx.mattersCount}
 - Files: ${ctx.filesCount}
 - Unread alerts: ${ctx.unreadAlertsCount}
-- Connected providers: ${ctx.connectors.filter((c) => c.status === 'connected').map((c) => c.provider).join(', ') || 'none'}
+- Connected providers: ${connected}
 
 Rules:
 - Never fabricate data you don't have.
@@ -81,59 +103,33 @@ function ruleBasedReply(message: string, ctx: WorkspaceContext): string {
   if (lower.includes('hello') || lower.includes('hi') || lower.includes('hey')) {
     return `Hello! I'm Libby, your NATICO workspace assistant. ${summarizeContext(ctx)} What would you like to work on?`
   }
-
   if (lower.includes('matter')) {
-    if (ctx.mattersCount === 0) {
-      return "You don't have any matters yet. Go to the Matters page and create your first one to get started."
-    }
+    if (ctx.mattersCount === 0) return "You don't have any matters yet. Go to the Matters page and create your first one to get started."
     return `You have ${ctx.mattersCount} matter${ctx.mattersCount !== 1 ? 's' : ''}. Head to the Matters page to review or add to them.`
   }
-
   if (lower.includes('file') || lower.includes('upload') || lower.includes('document')) {
-    if (ctx.filesCount === 0) {
-      return "No files have been uploaded yet. Go to the Files page to upload your first document."
-    }
+    if (ctx.filesCount === 0) return "No files have been uploaded yet. Go to the Files page to upload your first document."
     return `You have ${ctx.filesCount} file${ctx.filesCount !== 1 ? 's' : ''} uploaded. Visit the Files page to manage them.`
   }
-
   if (lower.includes('calendar') || lower.includes('event') || lower.includes('schedule')) {
-    const calConnector = ctx.connectors.find((c) => c.provider === 'google_calendar')
-    if (!calConnector || calConnector.status !== 'connected') {
-      return "Google Calendar is not connected. Visit the Connectors page to link your calendar and see upcoming events."
-    }
+    const cal = ctx.connectors.find((c) => c.provider === 'google_calendar')
+    if (!cal || cal.status !== 'connected') return "Google Calendar is not connected. Visit the Connectors page to link your calendar."
     return "Your Google Calendar is connected. Visit the Calendar page to see your upcoming events."
   }
-
-  if (lower.includes('github') || lower.includes('repo') || lower.includes('repository')) {
-    const ghConnector = ctx.connectors.find((c) => c.provider === 'github')
-    if (!ghConnector || ghConnector.status !== 'connected') {
-      return "GitHub is not connected. Visit the Connectors page to link your GitHub account for read-only repo access."
-    }
+  if (lower.includes('github') || lower.includes('repo')) {
+    const gh = ctx.connectors.find((c) => c.provider === 'github')
+    if (!gh || gh.status !== 'connected') return "GitHub is not connected. Visit the Connectors page to link your account."
     return "Your GitHub account is connected. Visit the Connectors page to view your repositories."
   }
-
   if (lower.includes('alert') || lower.includes('notification')) {
-    if (ctx.unreadAlertsCount === 0) {
-      return "You have no unread alerts. Your workspace is clear."
-    }
+    if (ctx.unreadAlertsCount === 0) return "You have no unread alerts. Your workspace is clear."
     return `You have ${ctx.unreadAlertsCount} unread alert${ctx.unreadAlertsCount !== 1 ? 's' : ''}. Visit the Alerts page to review them.`
   }
-
-  if (lower.includes('connector') || lower.includes('connect') || lower.includes('integration')) {
-    const connected = ctx.connectors.filter((c) => c.status === 'connected')
-    if (connected.length === 0) {
-      return "No connectors are active. Visit the Connectors page to link Google Calendar or GitHub."
-    }
-    const names = connected.map((c) =>
-      c.provider === 'google_calendar' ? 'Google Calendar' : 'GitHub',
-    )
-    return `Connected: ${names.join(', ')}. Visit the Connectors page to manage your integrations.`
+  if (lower.includes('key') || lower.includes('openrouter') || lower.includes('api')) {
+    return "To enable AI-powered replies, go to Settings and enter your OpenRouter API key. OpenRouter supports many models including GPT-4o, Claude, and Gemini."
   }
-
   if (lower.includes('help') || lower.includes('what can you do')) {
-    return "I can help you navigate your workspace. Ask me about matters, files, alerts, calendar events, or connectors. I'll tell you exactly what's in your workspace — no guessing."
+    return "I can help you navigate your workspace. Ask me about matters, files, alerts, calendar, or connectors. Add your OpenRouter API key in Settings for full AI replies."
   }
-
-  // Generic fallback
-  return `I'm not sure how to answer that specifically. Your current workspace has ${summarizeContext(ctx)} Ask me about matters, files, alerts, calendar events, or connectors and I'll give you a direct answer.`
+  return `I'm running in basic mode — add your OpenRouter API key in Settings to enable full AI replies. Your workspace: ${summarizeContext(ctx)}`
 }
